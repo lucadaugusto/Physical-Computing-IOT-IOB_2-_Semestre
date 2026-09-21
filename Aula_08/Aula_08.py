@@ -30,7 +30,7 @@ import serial
 
 # --- PARAMETROS ---------------------------------------------------------------
 
-PORTA_ESP32 = "COM8"           # ex.: "COM5" ou "/dev/ttyUSB0"; None = modo offline
+PORTA_ESP32 = "COMX"     # ex.: "COM5" ou "/dev/ttyUSB0"; None = modo offline
 BAUD_RATE = 115200
 HEARTBEAT_S = 0.10
 MODEL_PATH = "hand_landmarker.task"
