@@ -39,7 +39,7 @@ import serial
 
 # --- PARAMETROS ---------------------------------------------------------------
 
-PORTA_ESP32 = "COM8"
+PORTA_ESP32 = "COMX"     #Aqui colocar a porta COM de acordo com o ESP32 ex: COM5
 BAUD_RATE = 115200
 HEARTBEAT_S = 0.10
 MODEL_PATH = "face_landmarker.task"
