@@ -1,215 +1,101 @@
 /*
  * =============================================================================
- * Aula_08_MQTT.ino
- * Laboratorio 8 (Area de Seguranca) + publicacao dos dados no broker MQTT.
+ * Aula_10.ino  
+ * Laboratorio 10 (Area de Seguranca) + envio dos dados para o broker MQTT.
  * Placa: ESP32 Dev Module | Arduino IDE | Biblioteca: PubSubClient (Nick O'Leary)
  *
- * O LADO PYTHON (Aula_08.py) NAO MUDA. O protocolo serial e o mesmo:
- *   'S' = libera     'D' = trava     qualquer outro byte e ignorado
- *   O Python reenvia o estado a cada ~100 ms (heartbeat).
- *   WATCHDOG: 300 ms sem byte valido -> FALHA.
- *   REARME:   saindo de FALHA, so volta com link valido + botao de rearme.
+ * O Python (Aula_10.py) NAO MUDA. Ele continua mandando pela serial:
+ *   'S' = libera     'D' = trava     (a cada ~100 ms)
+ *   300 ms sem receber nada -> FALHA. Sair de FALHA so com o botao de rearme.
  *
- * ARQUITETURA:
- *   nucleo 1 - loop(): serial, watchdog, maquina de estados, LEDs, buzzer.
- *              Mesma logica do Aula_08.ino. Nunca chama nada de rede.
- *   nucleo 0 - tarefaMqtt(): Wi-Fi, conexao ao broker, publicacao.
- *              Pode bloquear por segundos sem afetar o interlock.
- *   nucleo 1 -> nucleo 0: fila de eventos com timeout zero.
+ * O ESP32 publica no broker (BASE = "fiap/pc/<BANCADA>"):
+ *   BASE/status      "online" ou "offline" (o broker publica "offline" sozinho
+ *                    se o ESP32 sumir: e o Last Will)
+ *   BASE/estado      LIBERADO, BLOQUEADO ou FALHA   (a cada mudanca)
+ *   BASE/telemetria  JSON a cada 2 segundos
  *
- * TOPICOS (BASE = "fiap/pc/<BANCADA>"), todos publicados pelo ESP32:
- *   BASE/status      "online" | "offline"          retido, Last Will = "offline"
- *   BASE/estado      LIBERADO | BLOQUEADO | FALHA  retido
- *   BASE/evento      JSON a cada transicao, com a causa
- *   BASE/telemetria  JSON a cada 2 s
  *
- * O ESP32 publica o que ELE sabe: estado, comandos recebidos do PC, rearmes,
- * quedas de link. Posicao da mao, d/R, v e a saida da MLP ficam no PC e nao
- * chegam aqui, porque o protocolo serial carrega so 'S' ou 'D'.
- *
- * Perder o broker NAO para nem libera a maquina: MQTT e so supervisao.
- *
- * LEDS (sempre um so aceso):
- *   verde = LIBERADO   vermelho = BLOQUEADO   amarelo = FALHA / aguardando rearme
- * BUZZER: 1 pulso = rearme / 'S' recebido   2 pulsos = 'D' recebido
- *
+ * LEDS: verde = LIBERADO   vermelho = BLOQUEADO   amarelo = FALHA
  * AVISO: demonstracao didatica, nao e dispositivo de seguranca.
  * =============================================================================
  */
 
-#include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// --- CONFIGURACAO DE REDE (EDITE AQUI) ---------------------------------------
-const char*    WIFI_SSID   = "LAB_IOT";
-const char*    WIFI_SENHA  = "trocar_senha";
-const char*    MQTT_HOST   = "192.168.0.10";   // IP do computador com o Mosquitto
-const uint16_t MQTT_PORTA  = 1883;
-const char*    BANCADA     = "bancada01";      // UNICO na sala
-const char*    PREFIXO     = "fiap/pc";
+// --- CONFIGURACAO (EDITE AQUI) ------------------------------------------------
+const char* WIFI_SSID  = "FIAP-IOT";        // Nome da rede Wi-Fi, importante a sua rede wi-fi ter suporte a dispositivos de 2,4GHz devido ao ESP32 utilizar essa frequência 
+const char* WIFI_SENHA = "F!@p25.IOT";      // Senha da rede Wi-Fi
+const char* MQTT_HOST  = "35.172.192.195";  // IP do computador com o Mosquitto
+const char* BANCADA    = "bancada0X";       // cada grupo usa um numero diferente
 
 // --- PINOS --------------------------------------------------------------------
-const int PINO_BUZZER        = 19;   // buzzer ATIVO (oscilador interno)
-const int PINO_LED_VERMELHO  = 18;
-const int PINO_LED_AMARELO   = 2;
-const int PINO_LED_VERDE     = 4;
-const int PINO_BOTAO_REARME  = 15;   // botao NA para GND, pull-up interno
-
-const bool BUZZER_ATIVO_EM_ALTO = true;
+const int PINO_BUZZER       = 19;
+const int PINO_LED_VERMELHO = 18;
+const int PINO_LED_AMARELO  = 2;
+const int PINO_LED_VERDE    = 4;
+const int PINO_BOTAO_REARME = 15;   // botao para GND, pull-up interno
 
 // --- TEMPOS -------------------------------------------------------------------
-const uint32_t BAUD_RATE        = 115200;
-const uint32_t TIMEOUT_LINK_MS  = 300;
-const uint32_t DEBOUNCE_MS      = 50;
-const uint32_t PULSO_MS         = 80;
-const uint16_t MQTT_KEEPALIVE_S = 5;      // broker declara morto em ~1,5 x 5 s
-const uint16_t MQTT_TIMEOUT_S   = 2;
-const uint32_t RECONEXAO_MS     = 3000;
-const uint32_t TELEMETRIA_MS    = 2000;
+const unsigned long TIMEOUT_LINK_MS = 300;    // watchdog da serial
+const unsigned long TELEMETRIA_MS   = 2000;   // envia telemetria a cada 2 s
+const unsigned long RECONEXAO_MS    = 5000;   // tenta o broker a cada 5 s
 
-// --- ESTADO -------------------------------------------------------------------
-enum Estado
-{
-  EST_FALHA,
-  EST_BLOQUEADO,
-  EST_LIBERADO
-};
+// --- ESTADOS ------------------------------------------------------------------
+const int FALHA     = 0;
+const int BLOQUEADO = 1;
+const int LIBERADO  = 2;
 
-enum Causa
-{
-  CAUSA_LINK,      // watchdog de 300 ms venceu
-  CAUSA_PC_S,      // PC mandou 'S' (visao: seguro)
-  CAUSA_PC_D,      // PC mandou 'D' (visao: perigo ou interlock travado)
-  CAUSA_REARME     // botao fisico
-};
+int  estado        = FALHA;
+char ultimoComando = 'D';
+bool recebeuByte   = false;
+unsigned long tUltimoByte = 0;
 
-struct Evento
-{
-  uint8_t  de;
-  uint8_t  para;
-  uint8_t  causa;
-  uint32_t tMs;
-};
+// Contadores que vao para a telemetria
+unsigned long interlocks = 0;   // vezes que a visao travou a maquina
+unsigned long falhas     = 0;   // vezes que o watchdog derrubou
 
-// Escritos SO no nucleo 1. O nucleo 0 le um instantaneo protegido por mux.
-volatile Estado estado = EST_FALHA;
-uint32_t nInterlocks     = 0;     // LIBERADO -> BLOQUEADO por 'D' do PC
-uint32_t nFalhas         = 0;     // entradas em FALHA
-uint32_t nRearmes        = 0;
-uint32_t tLiberadoMs     = 0;
-uint32_t tEntrouLiberado = 0;
-volatile uint32_t eventosPerdidos = 0;
-
-// Escritos no nucleo 1 (lerSerial), lidos tambem pela telemetria no nucleo 0.
-volatile char     ultimoComando    = 'D';
-volatile uint32_t tUltimoByte      = 0;
-volatile bool     recebeuAlgumByte = false;
-
-uint8_t  pulsosPendentes  = 0;
-bool     buzzerLigado     = false;
-uint32_t tBuzzer          = 0;
-
-portMUX_TYPE  mux = portMUX_INITIALIZER_UNLOCKED;
-QueueHandle_t filaEventos;
-
-// Objetos de rede: usados SO dentro de tarefaMqtt (nucleo 0).
-WiFiClient   wifiCliente;
-PubSubClient mqtt(wifiCliente);
-char topicoBase[64];
+// Rede
+WiFiClient   wifi;
+PubSubClient mqtt(wifi);
+char topicoStatus[64];
+char topicoEstado[64];
+char topicoTelemetria[64];
+unsigned long tUltimaTentativa = 0;
+unsigned long tUltimaTelemetria = 0;
 
 
 // --- TEXTOS -------------------------------------------------------------------
 
-const char* nomeEstado(uint8_t e)
+const char* nomeEstado(int e)
 {
-  switch (e)
+  if (e == LIBERADO)
   {
-    case EST_FALHA:     return "FALHA";
-    case EST_BLOQUEADO: return "BLOQUEADO";
-    case EST_LIBERADO:  return "LIBERADO";
+    return "LIBERADO";
   }
-  return "DESCONHECIDO";
-}
-
-const char* nomeCausa(uint8_t c)
-{
-  switch (c)
+  if (e == BLOQUEADO)
   {
-    case CAUSA_LINK:   return "LINK";
-    case CAUSA_PC_S:   return "PC_S";
-    case CAUSA_PC_D:   return "PC_D";
-    case CAUSA_REARME: return "REARME";
+    return "BLOQUEADO";
   }
-  return "?";
+  return "FALHA";
 }
 
 
-// --- BUZZER -------------------------------------------------------------------
+// --- SAIDAS -------------------------------------------------------------------
 
-void escreverBuzzer(bool tocar)
-{
-  if (tocar == BUZZER_ATIVO_EM_ALTO)
-  {
-    digitalWrite(PINO_BUZZER, HIGH);
-  }
-  else
-  {
-    digitalWrite(PINO_BUZZER, LOW);
-  }
-}
-
-void pulsar(uint8_t quantidade)
-{
-  pulsosPendentes = quantidade;
-}
-
-// Gera os pulsos sem delay(): alterna liga/desliga a cada PULSO_MS.
-void atualizarBuzzer()
-{
-  if (millis() - tBuzzer < PULSO_MS)
-  {
-    return;
-  }
-  tBuzzer = millis();
-
-  if (buzzerLigado)
-  {
-    buzzerLigado = false;
-  }
-  else if (pulsosPendentes > 0)
-  {
-    buzzerLigado = true;
-    pulsosPendentes--;
-  }
-  escreverBuzzer(buzzerLigado);
-}
-
-
-// --- LEDS ---------------------------------------------------------------------
-
-void escreverLed(int pino, bool aceso)
-{
-  if (aceso)
-  {
-    digitalWrite(pino, HIGH);
-  }
-  else
-  {
-    digitalWrite(pino, LOW);
-  }
-}
-
-// Exatamente um LED aceso por vez.
 void atualizarLeds()
 {
-  bool verde    = (estado == EST_LIBERADO);
-  bool vermelho = (estado == EST_BLOQUEADO);
-  bool amarelo  = !verde && !vermelho;
+  digitalWrite(PINO_LED_VERDE,    estado == LIBERADO);
+  digitalWrite(PINO_LED_VERMELHO, estado == BLOQUEADO);
+  digitalWrite(PINO_LED_AMARELO,  estado == FALHA);
+}
 
-  escreverLed(PINO_LED_VERDE, verde);
-  escreverLed(PINO_LED_VERMELHO, vermelho);
-  escreverLed(PINO_LED_AMARELO, amarelo);
+// Bip curto. Usa delay() de 80 ms: aceitavel, porque o watchdog e de 300 ms.
+void bip()
+{
+  digitalWrite(PINO_BUZZER, HIGH);
+  delay(80);
+  digitalWrite(PINO_BUZZER, LOW);
 }
 
 
@@ -219,314 +105,168 @@ void lerSerial()
 {
   while (Serial.available() > 0)
   {
-    int c = Serial.read();
-    if (c != 'S' && c != 'D')
+    char c = Serial.read();
+    if (c == 'S' || c == 'D')          // qualquer outro byte e ignorado
     {
-      continue;   // '\r', '\n' e lixo de boot nao renovam o watchdog
+      ultimoComando = c;
+      tUltimoByte   = millis();
+      recebeuByte   = true;
     }
-
-    // Pulsa so quando o comando muda; o heartbeat repetido fica mudo.
-    if (c != ultimoComando)
-    {
-      if (c == 'S')
-      {
-        pulsar(1);
-      }
-      else
-      {
-        pulsar(2);
-      }
-    }
-
-    ultimoComando    = (char)c;
-    tUltimoByte      = millis();
-    recebeuAlgumByte = true;
   }
 }
 
-bool linkEstaOk()
+bool linkOk()
 {
-  if (!recebeuAlgumByte)
+  if (!recebeuByte)
   {
     return false;
   }
   return (millis() - tUltimoByte) <= TIMEOUT_LINK_MS;
 }
 
-// true uma unica vez, na SOLTURA do botao. Botao travado nunca rearma.
-bool rearmeSolicitado()
+// Devolve true uma vez quando o botao e SOLTO (com debounce de 50 ms).
+bool botaoRearme()
 {
-  static bool     leituraAnterior    = false;
-  static bool     pressionadoEstavel = false;
-  static uint32_t tMudanca           = 0;
+  static bool apertado = false;
+  static unsigned long tMudanca = 0;
 
   bool leitura = (digitalRead(PINO_BOTAO_REARME) == LOW);
-
-  if (leitura != leituraAnterior)
+  if (millis() - tMudanca < 50)
   {
-    leituraAnterior = leitura;
+    return false;
+  }
+  if (leitura && !apertado)
+  {
+    apertado = true;
     tMudanca = millis();
-    return false;
   }
-  if (millis() - tMudanca < DEBOUNCE_MS)
+  else if (!leitura && apertado)
   {
-    return false;
-  }
-  if (leitura && !pressionadoEstavel)
-  {
-    pressionadoEstavel = true;
-  }
-  else if (!leitura && pressionadoEstavel)
-  {
-    pressionadoEstavel = false;
+    apertado = false;
+    tMudanca = millis();
     return true;
   }
   return false;
 }
 
 
-// --- EVENTOS (nucleo 1 -> nucleo 0) -------------------------------------------
-
-// Timeout ZERO: fila cheia descarta o evento e conta. O interlock nunca espera.
-void mudarEstado(Estado novo, uint8_t causa)
-{
-  Estado anterior = estado;
-  if (novo == anterior)
-  {
-    return;
-  }
-
-  uint32_t agora = millis();
-
-  portENTER_CRITICAL(&mux);
-  if (anterior == EST_LIBERADO)
-  {
-    tLiberadoMs += agora - tEntrouLiberado;
-  }
-  if (novo == EST_LIBERADO)
-  {
-    tEntrouLiberado = agora;
-  }
-  if (anterior == EST_LIBERADO && novo == EST_BLOQUEADO)
-  {
-    nInterlocks++;
-  }
-  if (novo == EST_FALHA)
-  {
-    nFalhas++;
-  }
-  if (causa == CAUSA_REARME)
-  {
-    nRearmes++;
-  }
-  estado = novo;
-  portEXIT_CRITICAL(&mux);
-
-  Evento ev;
-  ev.de    = anterior;
-  ev.para  = novo;
-  ev.causa = causa;
-  ev.tMs   = agora;
-  if (xQueueSend(filaEventos, &ev, 0) != pdTRUE)
-  {
-    eventosPerdidos = eventosPerdidos + 1;
-  }
-}
-
-
-// --- MAQUINA DE ESTADOS (mesma logica do Aula_08.ino) -------------------------
-
-void transicionar(bool linkOk, bool rearme)
-{
-  switch (estado)
-  {
-    case EST_FALHA:
-      if (linkOk && rearme)
-      {
-        mudarEstado(EST_BLOQUEADO, CAUSA_REARME);   // nunca direto para LIBERADO
-      }
-      break;
-
-    case EST_BLOQUEADO:
-      if (!linkOk)
-      {
-        mudarEstado(EST_FALHA, CAUSA_LINK);
-      }
-      else if (ultimoComando == 'S')
-      {
-        mudarEstado(EST_LIBERADO, CAUSA_PC_S);
-      }
-      break;
-
-    case EST_LIBERADO:
-      if (!linkOk)
-      {
-        mudarEstado(EST_FALHA, CAUSA_LINK);
-      }
-      else if (ultimoComando == 'D')
-      {
-        mudarEstado(EST_BLOQUEADO, CAUSA_PC_D);
-      }
-      break;
-  }
-}
-
-
-// --- MQTT (SO NO NUCLEO 0) ----------------------------------------------------
-
-void montarTopico(char* destino, size_t tamanho, const char* sufixo)
-{
-  snprintf(destino, tamanho, "%s/%s", topicoBase, sufixo);
-}
+// --- MQTT ---------------------------------------------------------------------
 
 void publicarEstado()
 {
-  char topico[96];
-  montarTopico(topico, sizeof(topico), "estado");
-  mqtt.publish(topico, nomeEstado(estado), true);
-}
-
-bool conectarMqtt()
-{
-  char topicoStatus[96];
-  char clientId[48];
-
-  montarTopico(topicoStatus, sizeof(topicoStatus), "status");
-  snprintf(clientId, sizeof(clientId), "fiap-pc-%s", BANCADA);
-
-  // Last Will: se o ESP32 sumir sem DISCONNECT, o broker publica "offline".
-  bool ok = mqtt.connect(clientId, topicoStatus, 1, true, "offline");
-  if (!ok)
+  if (mqtt.connected())
   {
-    Serial.printf("[MQTT] falha ao conectar, rc=%d\n", mqtt.state());
-    return false;
-  }
-
-  mqtt.publish(topicoStatus, "online", true);
-  publicarEstado();
-  Serial.printf("[MQTT] conectado como %s\n", clientId);
-  return true;
-}
-
-void publicarEventosPendentes()
-{
-  char topico[96];
-  char json[160];
-  Evento ev;
-
-  montarTopico(topico, sizeof(topico), "evento");
-  while (xQueueReceive(filaEventos, &ev, 0) == pdTRUE)
-  {
-    snprintf(json, sizeof(json),
-             "{\"de\":\"%s\",\"para\":\"%s\",\"causa\":\"%s\",\"t_ms\":%lu}",
-             nomeEstado(ev.de), nomeEstado(ev.para), nomeCausa(ev.causa),
-             (unsigned long)ev.tMs);
-    mqtt.publish(topico, json, false);
-    publicarEstado();
+    mqtt.publish(topicoEstado, nomeEstado(estado), true);   // true = retido
   }
 }
 
 void publicarTelemetria()
 {
-  uint32_t agora = millis();
-  uint8_t  e;
-  uint32_t liberado;
-  uint32_t interlocks;
-  uint32_t falhas;
-  uint32_t rearmes;
-  char     cmd;
-  uint32_t idadeLink;
-
-  // Instantaneo coerente: campos lidos juntos, sem o nucleo 1 no meio.
-  portENTER_CRITICAL(&mux);
-  e          = estado;
-  liberado   = tLiberadoMs;
-  interlocks = nInterlocks;
-  falhas     = nFalhas;
-  rearmes    = nRearmes;
-  cmd        = ultimoComando;
-  uint32_t t = tUltimoByte;
-  if (e == EST_LIBERADO)
-  {
-    liberado += agora - tEntrouLiberado;
-  }
-  portEXIT_CRITICAL(&mux);
-
-  // O nucleo 1 pode ter carimbado um byte depois de 'agora' ser lido.
-  idadeLink = 0;
-  if (recebeuAlgumByte && agora > t)
-  {
-    idadeLink = agora - t;
-  }
-
-  float disponibilidade = 0.0f;
-  if (agora > 0)
-  {
-    disponibilidade = (float)liberado / (float)agora;
-  }
-
-  char topico[96];
-  char json[256];
-  montarTopico(topico, sizeof(topico), "telemetria");
+  char json[160];
   snprintf(json, sizeof(json),
-           "{\"estado\":\"%s\",\"ultimo_cmd\":\"%c\",\"idade_link_ms\":%lu,"
-           "\"uptime_s\":%lu,\"liberado_s\":%lu,\"disp\":%.3f,"
-           "\"interlocks\":%lu,\"falhas\":%lu,\"rearmes\":%lu,"
-           "\"rssi\":%d,\"perdidos\":%lu}",
-           nomeEstado(e), cmd, (unsigned long)idadeLink,
-           (unsigned long)(agora / 1000), (unsigned long)(liberado / 1000),
-           disponibilidade, (unsigned long)interlocks, (unsigned long)falhas,
-           (unsigned long)rearmes, (int)WiFi.RSSI(), (unsigned long)eventosPerdidos);
-  mqtt.publish(topico, json, false);
+           "{\"estado\":\"%s\",\"ultimo_cmd\":\"%c\",\"interlocks\":%lu,"
+           "\"falhas\":%lu,\"uptime_s\":%lu,\"rssi\":%d}",
+           nomeEstado(estado), ultimoComando, interlocks, falhas,
+           (unsigned long)(millis() / 1000), (int)WiFi.RSSI());
+  mqtt.publish(topicoTelemetria, json);
 }
 
-void tarefaMqtt(void* parametro)
+void conectarBroker()
 {
-  (void)parametro;
+  char clientId[40];
+  snprintf(clientId, sizeof(clientId), "fiap-pc-%s", BANCADA);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_SENHA);
-
-  mqtt.setServer(MQTT_HOST, MQTT_PORTA);
-  mqtt.setKeepAlive(MQTT_KEEPALIVE_S);
-  mqtt.setSocketTimeout(MQTT_TIMEOUT_S);
-  mqtt.setBufferSize(512);
-
-  uint32_t tTentativa  = 0;
-  uint32_t tTelemetria = 0;
-  bool     primeira    = true;
-
-  for (;;)
+  // Last Will: se o ESP32 desaparecer, o broker publica "offline" no lugar dele.
+  if (mqtt.connect(clientId, topicoStatus, 1, true, "offline"))
   {
-    if (WiFi.status() != WL_CONNECTED)
+    mqtt.publish(topicoStatus, "online", true);
+    publicarEstado();
+    Serial.println("[MQTT] conectado");
+  }
+  else
+  {
+    Serial.print("[MQTT] falhou, rc=");
+    Serial.println(mqtt.state());
+  }
+}
+
+// Chamada a cada volta do loop(). Nunca tenta conectar com a maquina LIBERADA.
+void cuidarDaRede()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return;                                  // o ESP32 reconecta o Wi-Fi sozinho
+  }
+
+  if (!mqtt.connected())
+  {
+    if (estado == LIBERADO)
     {
-      vTaskDelay(pdMS_TO_TICKS(250));
-      continue;
+      return;                                // REGRA DE OURO: nao arrisca travar
     }
-
-    if (!mqtt.connected())
+    if (millis() - tUltimaTentativa > RECONEXAO_MS)
     {
-      if (primeira || (millis() - tTentativa) > RECONEXAO_MS)
-      {
-        primeira   = false;
-        tTentativa = millis();
-        conectarMqtt();   // pode bloquear por segundos: aqui isso nao importa
-      }
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
+      tUltimaTentativa = millis();
+      conectarBroker();                      // pode demorar alguns segundos
     }
+    return;
+  }
 
-    mqtt.loop();   // mantem o keepalive (PINGREQ)
-    publicarEventosPendentes();
+  mqtt.loop();                               // mantem a conexao viva
 
-    if (millis() - tTelemetria > TELEMETRIA_MS)
+  if (millis() - tUltimaTelemetria > TELEMETRIA_MS)
+  {
+    tUltimaTelemetria = millis();
+    publicarTelemetria();
+  }
+}
+
+
+// --- MAQUINA DE ESTADOS -------------------------------------------------------
+
+void mudarPara(int novo)
+{
+  if (novo == estado)
+  {
+    return;
+  }
+  if (estado == LIBERADO && novo == BLOQUEADO)
+  {
+    interlocks++;
+  }
+  if (novo == FALHA)
+  {
+    falhas++;
+  }
+  estado = novo;
+  atualizarLeds();
+  publicarEstado();
+  bip();
+}
+
+void maquinaDeEstados()
+{
+  bool link   = linkOk();
+  bool rearme = botaoRearme();
+
+  if (estado == FALHA)
+  {
+    if (link && rearme)
     {
-      tTelemetria = millis();
-      publicarTelemetria();
+      mudarPara(BLOQUEADO);                  // nunca direto para LIBERADO
     }
-
-    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  else if (!link)
+  {
+    mudarPara(FALHA);                        // watchdog: 300 ms sem byte
+  }
+  else if (ultimoComando == 'S')
+  {
+    mudarPara(LIBERADO);
+  }
+  else
+  {
+    mudarPara(BLOQUEADO);
   }
 }
 
@@ -536,35 +276,30 @@ void tarefaMqtt(void* parametro)
 void setup()
 {
   pinMode(PINO_BUZZER, OUTPUT);
-  escreverBuzzer(false);
-
   pinMode(PINO_LED_VERDE, OUTPUT);
   pinMode(PINO_LED_VERMELHO, OUTPUT);
   pinMode(PINO_LED_AMARELO, OUTPUT);
   pinMode(PINO_BOTAO_REARME, INPUT_PULLUP);
-
-  Serial.begin(BAUD_RATE);
   atualizarLeds();
 
-  snprintf(topicoBase, sizeof(topicoBase), "%s/%s", PREFIXO, BANCADA);
-  filaEventos = xQueueCreate(16, sizeof(Evento));
+  Serial.begin(115200);
 
-  // Nucleo 0, prioridade 1. O loop() do Arduino roda no nucleo 1.
-  xTaskCreatePinnedToCore(tarefaMqtt, "mqtt", 6144, NULL, 1, NULL, 0);
+  snprintf(topicoStatus,     sizeof(topicoStatus),     "fiap/pc/%s/status", BANCADA);
+  snprintf(topicoEstado,     sizeof(topicoEstado),     "fiap/pc/%s/estado", BANCADA);
+  snprintf(topicoTelemetria, sizeof(topicoTelemetria), "fiap/pc/%s/telemetria", BANCADA);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_SENHA);         // nao espera: conecta em segundo plano
+
+  mqtt.setServer(MQTT_HOST, 1883);
+  mqtt.setKeepAlive(5);                      // broker percebe queda em ~7,5 s
+  mqtt.setSocketTimeout(1);                  // espera no maximo 1 s pela resposta
 }
 
 void loop()
 {
   lerSerial();
-
-  bool linkOk = linkEstaOk();
-  bool rearme = rearmeSolicitado();
-  if (rearme)
-  {
-    pulsar(1);
-  }
-
-  transicionar(linkOk, rearme);
-  atualizarLeds();
-  atualizarBuzzer();
+  maquinaDeEstados();
+  cuidarDaRede();
 }
+
